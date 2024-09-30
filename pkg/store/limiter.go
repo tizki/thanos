@@ -4,7 +4,10 @@
 package store
 
 import (
+	"encoding/hex"
+	"fmt"
 	"sync"
+	"time"
 
 	"github.com/alecthomas/units"
 	"github.com/pkg/errors"
@@ -12,6 +15,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"go.uber.org/atomic"
 
+	"crypto/sha256"
 	"github.com/thanos-io/thanos/pkg/extkingpin"
 	"github.com/thanos-io/thanos/pkg/store/storepb"
 )
@@ -70,11 +74,14 @@ func (l *Limiter) Reserve(num uint64) error {
 	if l.limit == 0 {
 		return nil
 	}
-	if reserved := l.reserved.Add(num); reserved > l.limit {
+	reserved := l.reserved.Add(num)
+	if reserved > l.limit {
 		// We need to protect from the counter being incremented twice due to concurrency
 		// while calling Reserve().
 		l.failedOnce.Do(l.failedCounter.Inc)
 		return errors.Errorf("limit %v violated (got %v)", l.limit, reserved)
+	} else {
+		fmt.Printf("Reserved %v chunks out of %v\n", l.reserved, l.limit)
 	}
 	return nil
 }
@@ -168,9 +175,35 @@ func (i *limitedServer) Send(response *storepb.SeriesResponse) error {
 		return i.Store_SeriesServer.Send(response)
 	}
 
+	// Print labels of each series
+	fmt.Printf("Labels: %v\n", series.Labels)
+
+	// Calculate min and max time of the chunks
+	var minTime, maxTime int64
+	if len(series.Chunks) > 0 {
+		minTime = series.Chunks[0].MinTime
+		maxTime = series.Chunks[0].MaxTime
+		for _, chunk := range series.Chunks {
+			if chunk.MinTime < minTime {
+				minTime = chunk.MinTime
+			}
+			if chunk.MaxTime > maxTime {
+				maxTime = chunk.MaxTime
+			}
+		}
+	}
+	fmt.Printf("Min Time: %s, Max Time: %s\n", time.Unix(minTime, 0).Format(time.RFC3339), time.Unix(maxTime, 0).Format(time.RFC3339))
+
+	// Print hash of the chunks
+	for _, chunk := range series.Chunks {
+		hash := sha256.Sum256(chunk.Raw.Data)
+		fmt.Printf("Chunk Hash: %s\n", hex.EncodeToString(hash[:]))
+	}
+
 	if err := i.seriesLimiter.Reserve(1); err != nil {
 		return errors.Wrapf(err, "failed to send series")
 	}
+	//fmt.Printf("Checking chunks with IDs: %v\n", series.Chunks)
 	if err := i.samplesLimiter.Reserve(uint64(len(series.Chunks) * MaxSamplesPerChunk)); err != nil {
 		return errors.Wrapf(err, "failed to send samples")
 	}
